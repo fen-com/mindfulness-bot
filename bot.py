@@ -5,7 +5,7 @@ import os
 from datetime import time
 from telegram.ext import Updater, CommandHandler
 
-TOKEN = 8150860871:AAHxLap18Xr1ib9UoBHkHO_CvVD3h1GlLgQ
+TOKEN = "8150860871:AAHxLap18Xr1ib9UoBHkHO_CvVD3h1GlLgQ"
 
 # ✅ ЛОГИРУЕМ В ФАЙЛ
 logging.basicConfig(
