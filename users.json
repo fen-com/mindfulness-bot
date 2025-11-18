@@ -6,8 +6,8 @@
     "count": 10,
     "enabled": true,
     "planned_today": 10,
-    "sent_today": 10,
-    "last_plan_date_utc": "2025-11-17"
+    "sent_today": 0,
+    "last_plan_date_utc": "2025-11-18"
   },
   "399999444": {
     "tz_offset": 11,
@@ -16,8 +16,8 @@
     "count": 3,
     "enabled": true,
     "planned_today": 3,
-    "sent_today": 3,
-    "last_plan_date_utc": "2025-11-17"
+    "sent_today": 0,
+    "last_plan_date_utc": "2025-11-18"
   },
   "920838358": {
     "tz_offset": 10,
@@ -26,7 +26,7 @@
     "count": 5,
     "enabled": true,
     "planned_today": 5,
-    "sent_today": 5,
-    "last_plan_date_utc": "2025-11-17"
+    "sent_today": 0,
+    "last_plan_date_utc": "2025-11-18"
   }
 }
