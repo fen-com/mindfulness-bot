@@ -1,21 +1,24 @@
-import json
-import logging
 import os
+import json
 import random
+import pytz
+import logging
+from datetime import datetime, timedelta, timezone, time
 from dataclasses import dataclass, asdict
-from datetime import datetime, time, timedelta, timezone
 from typing import Dict, Optional
+
+from flask import Flask, request
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ===================== ЛОГИ =====================
+# ---------------------- LOGGING ----------------------
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -23,11 +26,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ===================== КОНСТАНТЫ =====================
+# ---------------------- CONSTANTS ----------------------
 
 USERS_FILE = "users.json"
 
-TOKEN = "8150860871:AAHxLap18Xr1ib9UoBHkHO_CvVD3h1GlLgQ"
+TOKEN = os.getenv("BOT_TOKEN")   # Render env variable
+WEBHOOK_URL = "https://mindfulness-bot.onrender.com/webhook"  # ← поменяй на свой домен!
 
 MIN_COUNT = 3
 MAX_COUNT = 10
@@ -45,7 +49,7 @@ PROMPTS = [
     "Чем бы ты занялся, если бы был на 5% более осознанным прямо сейчас?",
 ]
 
-# ===================== МОДЕЛЬ ПОЛЬЗОВАТЕЛЯ =====================
+# ---------------------- DATA MODEL ----------------------
 
 @dataclass
 class UserSettings:
@@ -62,12 +66,11 @@ class UserSettings:
 
 USERS: Dict[int, UserSettings] = {}
 
-# ===================== РАБОТА С ФАЙЛОМ =====================
+# ---------------------- USER STORAGE ----------------------
 
 def load_users() -> None:
     global USERS
     if not os.path.exists(USERS_FILE):
-        log.info("Users file not found, starting fresh")
         USERS = {}
         return
 
@@ -82,371 +85,337 @@ def load_users() -> None:
     tmp = {}
     for uid_str, data in raw.items():
         try:
-            uid = int(uid_str)
-        except:
-            continue
-
-        if not isinstance(data, dict):
-            continue
-
-        migrated = dict(data)
-
-        if "tz" in migrated and "tz_offset" not in migrated:
-            migrated["tz_offset"] = migrated["tz"]
-        if "start" in migrated and "start_hour" not in migrated:
-            migrated["start_hour"] = migrated["start"]
-        if "end" in migrated and "end_hour" not in migrated:
-            migrated["end_hour"] = migrated["end"]
-
-        allow = UserSettings.__dataclass_fields__.keys()
-        clean = {k: v for k, v in migrated.items() if k in allow}
-
-        try:
-            tmp[uid] = UserSettings(**clean)
+            tmp[int(uid_str)] = UserSettings(**data)
         except Exception as e:
-            log.error("Failed to load user %s: %s", uid, e)
+            log.error("Bad user record: %s", e)
 
     USERS = tmp
-    log.info("Loaded %d users (with migration support)", len(USERS))
+    log.info("Loaded %d users", len(USERS))
 
 
 def save_users() -> None:
     try:
-        data = {str(uid): asdict(settings) for uid, settings in USERS.items()}
+        data = {str(uid): asdict(s) for uid, s in USERS.items()}
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log.error("Failed to save users: %s", e)
 
-# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
+# ---------------------- HELPERS ----------------------
 
-def get_user_tz(settings: UserSettings) -> timezone:
-    return timezone(timedelta(hours=settings.tz_offset))
+def get_user_tz(s: UserSettings):
+    return timezone(timedelta(hours=s.tz_offset))
 
-def clear_user_jobs(app, uid: int) -> None:
-    jq = app.job_queue
-    scheduler = jq.scheduler
-    for job in scheduler.get_jobs():
+
+def clear_jobs(app, uid: int):
+    for job in app.job_queue.scheduler.get_jobs():
         if job.name in (f"msg_{uid}", f"midnight_{uid}"):
             job.remove()
 
-# ===================== ПЛАНИРОВАНИЕ =====================
 
-def plan_today(app, uid: int, settings: UserSettings) -> None:
-    tz = get_user_tz(settings)
+def schedule_today(app, uid: int, s: UserSettings):
+    tz = get_user_tz(s)
     now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(tz)
-    today_local = now_local.date()
+    now_loc = now_utc.astimezone(tz)
 
-    start = settings.start_hour
-    end = settings.end_hour
+    start, end = s.start_hour, s.end_hour
     if start >= end:
         start, end = DEFAULT_START, DEFAULT_END
 
-    times_local = []
-    for _ in range(settings.count):
+    today = now_loc.date()
+    times_loc = []
+
+    for _ in range(s.count):
         h = random.randint(start, end - 1)
         m = random.randint(0, 59)
-        tloc = datetime.combine(today_local, time(h, m), tzinfo=tz)
-        times_local.append(tloc)
+        dt = datetime.combine(today, time(h, m), tzinfo=tz)
 
-    times_local.sort()
+        # задержка отправки 5 минут, как просил
+        dt += timedelta(minutes=5)
 
-    settings.planned_today = len(times_local)
-    settings.sent_today = 0
-    settings.last_plan_date_utc = now_utc.date().isoformat()
+        times_loc.append(dt)
+
+    times_loc.sort()
+
+    s.planned_today = len(times_loc)
+    s.sent_today = 0
+    s.last_plan_date_utc = now_utc.date().isoformat()
     save_users()
 
-    jq = app.job_queue
-    for dt_loc in times_local:
-        dt_utc = dt_loc.astimezone(timezone.utc)
-        dt_naive = dt_utc.replace(tzinfo=None)
-
-        jq.run_once(
+    for dt_loc in times_loc:
+        dt_utc = dt_loc.astimezone(timezone.utc).replace(tzinfo=None)
+        app.job_queue.run_once(
             job_send_message,
-            when=dt_naive,
+            when=dt_utc,
             name=f"msg_{uid}",
-            data={"uid": uid, "scheduled_utc": dt_utc.isoformat()},
+            data={"uid": uid},
             job_kwargs={
-                "misfire_grace_time": 86400,
+                "misfire_grace_time": 60*60*24,
                 "coalesce": False,
             },
         )
-        log.info("Scheduled msg for %s at %s", uid, dt_naive.isoformat())
-
-    log.info("[%s] %d msgs planned for today", uid, settings.planned_today)
+        log.info("Planned %s at %s", uid, dt_utc)
 
 
-def schedule_midnight(app, uid: int, settings: UserSettings) -> None:
-    tz = get_user_tz(settings)
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(tz)
-
-    next_mid_local = datetime.combine(now_local.date(), time(0, 0), tzinfo=tz) + timedelta(days=1)
-    next_mid_utc = next_mid_local.astimezone(timezone.utc)
-    next_naive = next_mid_utc.replace(tzinfo=None)
+def schedule_midnight(app, uid: int, s: UserSettings):
+    tz = get_user_tz(s)
+    now = datetime.now(timezone.utc).astimezone(tz)
+    next_mid = datetime.combine(now.date(), time(0,0), tzinfo=tz) + timedelta(days=1)
+    dt = next_mid.astimezone(timezone.utc).replace(tzinfo=None)
 
     app.job_queue.run_once(
         job_midnight,
-        when=next_naive,
+        when=dt,
         name=f"midnight_{uid}",
         data={"uid": uid},
-        job_kwargs={
-            "misfire_grace_time": 86400,
-            "coalesce": False,
-        },
+        job_kwargs={"misfire_grace_time": 60*60*24, "coalesce": False},
     )
-    log.info("[%s] midnight job -> %s", uid, next_naive.isoformat())
 
-# ===================== JOB CALLBACKS =====================
+# ---------------------- JOBS ----------------------
 
-async def job_send_message(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    uid = job.data["uid"]
-    settings = USERS.get(uid)
-    if not settings or not settings.enabled:
+async def job_send_message(ctx: ContextTypes.DEFAULT_TYPE):
+    uid = ctx.job.data["uid"]
+    s = USERS.get(uid)
+    if not s or not s.enabled:
         return
-
-    # ----- НОВАЯ ЛОГИКА "запланированное время +5 минут" -----
-    scheduled_str = job.data.get("scheduled_utc")
-    if scheduled_str:
-        scheduled_dt = datetime.fromisoformat(scheduled_str)
-        now_utc = datetime.now(timezone.utc)
-        if now_utc > scheduled_dt + timedelta(minutes=5):
-            log.info("Skipping msg for %s (too late, >5 min)", uid)
-            return
-    # ----------------------------------------------------------
 
     text = random.choice(PROMPTS)
     try:
-        await context.bot.send_message(chat_id=uid, text=text)
-        settings.sent_today += 1
+        await ctx.bot.send_message(uid, text)
+        s.sent_today += 1
         save_users()
-        log.info("Sent msg to %s (%d/%d)", uid, settings.sent_today, settings.planned_today)
     except Exception as e:
-        log.error("Failed to send msg: %s", e)
+        log.error("Send fail: %s", e)
 
 
-async def job_midnight(context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = context.job.data["uid"]
-    app = context.application
-    settings = USERS.get(uid)
-    if not settings:
+async def job_midnight(ctx: ContextTypes.DEFAULT_TYPE):
+    uid = ctx.job.data["uid"]
+    app = ctx.application
+    s = USERS.get(uid)
+    if not s:
         return
 
-    clear_user_jobs(app, uid)
-    plan_today(app, uid, settings)
-    schedule_midnight(app, uid, settings)
-    log.info("Midnight run for %s", uid)
+    clear_jobs(app, uid)
+    schedule_today(app, uid, s)
+    schedule_midnight(app, uid, s)
 
-# ===================== КОМАНДЫ =====================
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or not update.message:
-        return
-    uid = user.id
+async def job_ping(ctx: ContextTypes.DEFAULT_TYPE):
+    """Пинг Render каждые 10 минут"""
+    import requests
+    try:
+        requests.get(os.getenv("PING_URL", WEBHOOK_URL.replace("/webhook", "/ping")))
+    except:
+        pass
 
-    settings = USERS.get(uid)
-    if not settings:
-        settings = UserSettings()
-        USERS[uid] = settings
+# ---------------------- COMMANDS ----------------------
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in USERS:
+        USERS[uid] = UserSettings()
         save_users()
 
-    app = context.application
-    clear_user_jobs(app, uid)
-    plan_today(app, uid, settings)
-    schedule_midnight(app, uid, settings)
+    s = USERS[uid]
+    app = ctx.application
+
+    clear_jobs(app, uid)
+    schedule_today(app, uid, s)
+    schedule_midnight(app, uid, s)
 
     await update.message.reply_text(
-        "✨ Бот запущен!\n\n"
-        "Чтобы всё работало корректно — установи часовой пояс через /settz.\n"
-        "И диапазон времени через /settime.\n\n"
-        "Я уже работаю и буду слать уведомления каждый день.\n"
-        "Посмотреть текущие настройки можно через /status."
+        "✨ Бот готов! Установи /settz, /settime и /setcount.\n"
+        "Посмотреть настройки: /status"
     )
 
 
-async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = "set_tz"
+# SET TZ
+async def settz(update: Update, ctx):
+    ctx.user_data["mode"] = "tz"
     await update.message.reply_text("Пришли GMT, например +11")
 
 
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = "set_time"
-    await update.message.reply_text("Пришли диапазон: начало конец (пример: 9 19)")
+# SET TIME
+async def settime(update: Update, ctx):
+    ctx.user_data["mode"] = "time"
+    await update.message.reply_text("Пришли диапазон: начало конец (9 19)")
 
 
-async def cmd_setcount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["mode"] = "set_count"
-    await update.message.reply_text("Пришли количество уведомлений (3–10).")
+# SET COUNT
+async def setcount(update: Update, ctx):
+    ctx.user_data["mode"] = "count"
+    await update.message.reply_text("Пришли количество уведомлений (3–10)")
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# STATUS
+async def status(update: Update, ctx):
     uid = update.effective_user.id
-    settings = USERS.get(uid)
-    if not settings:
-        await update.message.reply_text("Набери /start")
+    s = USERS.get(uid)
+    if not s:
+        await update.message.reply_text("Нажми /start")
         return
 
-    tz = get_user_tz(settings)
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(tz)
-    today_local = now_local.date()
+    tz = get_user_tz(s)
+    now_loc = datetime.now(timezone.utc).astimezone(tz)
 
-    scheduler = context.application.job_queue.scheduler
-    upcoming = []
-
-    for job in scheduler.get_jobs():
+    jobs = []
+    for job in ctx.application.job_queue.scheduler.get_jobs():
         if job.name == f"msg_{uid}" and job.next_run_time:
-            run_loc = job.next_run_time.replace(tzinfo=timezone.utc).astimezone(tz)
-            if run_loc.date() == today_local:
-                upcoming.append(run_loc)
+            loc = job.next_run_time.replace(tzinfo=timezone.utc).astimezone(tz)
+            jobs.append(loc)
 
-    upcoming.sort()
+    jobs.sort()
 
-    planned = settings.planned_today
-    sent = settings.sent_today
-    remaining = max(planned - sent, 0)
+    text = (
+        f"📊 Статус:\n"
+        f"Часовой пояс: GMT{s.tz_offset:+d}\n"
+        f"Диапазон: {s.start_hour}–{s.end_hour}\n"
+        f"Уведомлений: {s.count}\n\n"
+        f"Отправлено сегодня: {s.sent_today}\n"
+        f"Осталось: {max(s.planned_today - s.sent_today, 0)}\n"
+    )
 
-    lines = [
-        "📊 Статус на сегодня:\n",
-        f"Часовой пояс: GMT{settings.tz_offset:+d}",
-        f"Диапазон: {settings.start_hour}–{settings.end_hour}",
-        f"Уведомлений в день: {settings.count}\n",
-        f"Сегодня отправлено: {sent}",
-        f"Осталось: {remaining}\n",
-    ]
+    if jobs:
+        text += "\nБлижайшие уведомления:\n"
+        for dt in jobs:
+            text += f"• {dt.strftime('%H:%M')}\n"
 
-    if upcoming:
-        lines.append("Ближайшие уведомления:")
-        for dt in upcoming:
-            mark = "👉" if dt > now_local else "✓"
-            lines.append(f"{mark} {dt.strftime('%H:%M')}")
-    else:
-        lines.append("На сегодня уведомлений больше нет.")
-
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(text)
 
 
-# ===================== ОБРАБОТКА ТЕКСТА =====================
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Handle text input for commands
+async def handle(update: Update, ctx):
     if not update.message:
         return
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    mode = context.user_data.get("mode")
 
+    uid = update.effective_user.id
+    s = USERS.get(uid)
+    app = ctx.application
+
+    mode = ctx.user_data.get("mode")
     if not mode:
         return
 
-    settings = USERS.get(uid)
-    if not settings:
-        settings = UserSettings()
-        USERS[uid] = settings
+    txt = update.message.text.strip()
 
-    app = context.application
-
-    # ---- SET TZ ----
-    if mode == "set_tz":
+    # SET TZ
+    if mode == "tz":
         try:
-            if text.startswith("GMT") or text.startswith("gmt"):
-                text = text[3:].strip()
-            tz_val = int(text)
+            if txt.startswith("GMT") or txt.startswith("gmt"):
+                txt = txt[3:].strip()
+            val = int(txt)
         except:
-            await update.message.reply_text("Неверный формат. Пример: +11")
-            return
+            return await update.message.reply_text("Неверный формат. Пример: +11")
 
-        if not (-12 <= tz_val <= 14):
-            await update.message.reply_text("Диапазон GMT: -12…+14")
-            return
+        if not -12 <= val <= 14:
+            return await update.message.reply_text("Диапазон GMT от -12 до +14.")
 
-        settings.tz_offset = tz_val
+        s.tz_offset = val
         save_users()
 
-        clear_user_jobs(app, uid)
-        plan_today(app, uid, settings)
-        schedule_midnight(app, uid, settings)
+        clear_jobs(app, uid)
+        schedule_today(app, uid, s)
+        schedule_midnight(app, uid, s)
 
-        context.user_data["mode"] = None
-        await update.message.reply_text(f"Окей, GMT{tz_val:+d}. План обновлён.")
-        return
+        ctx.user_data["mode"] = None
+        return await update.message.reply_text(f"Часовой пояс обновлён: GMT{val:+d}")
 
-    # ---- SET TIME ----
-    if mode == "set_time":
-        parts = text.replace(",", " ").split()
+    # SET TIME
+    if mode == "time":
+        parts = txt.split()
         if len(parts) != 2:
-            await update.message.reply_text("Неверный формат. Пример: 9 19")
-            return
+            return await update.message.reply_text("Формат: 9 19")
+
         try:
-            s = int(parts[0])
-            e = int(parts[1])
+            start_h = int(parts[0])
+            end_h = int(parts[1])
         except:
-            await update.message.reply_text("Нужно два числа, пример: 9 19")
-            return
+            return await update.message.reply_text("Только числа: 9 19")
 
-        if not (0 <= s < 24 and 0 < e <= 24 and s < e):
-            await update.message.reply_text("Неверный диапазон. Пример: 9 19")
-            return
+        if not (0 <= start_h <= 23 and 0 <= end_h <= 24 and start_h < end_h):
+            return await update.message.reply_text("Начало < конец, пример 9 19")
 
-        settings.start_hour = s
-        settings.end_hour = e
+        s.start_hour = start_h
+        s.end_hour = end_h
         save_users()
 
-        clear_user_jobs(app, uid)
-        plan_today(app, uid, settings)
-        schedule_midnight(app, uid, settings)
+        clear_jobs(app, uid)
+        schedule_today(app, uid, s)
+        schedule_midnight(app, uid, s)
 
-        context.user_data["mode"] = None
-        await update.message.reply_text(f"Диапазон обновлён: {s}:00–{e}:00")
-        return
+        ctx.user_data["mode"] = None
+        return await update.message.reply_text(f"Диапазон обновлён: {start_h}:00–{end_h}:00")
 
-    # ---- SET COUNT ----
-    if mode == "set_count":
+    # SET COUNT
+    if mode == "count":
         try:
-            cnt = int(text)
+            cnt = int(txt)
         except:
-            await update.message.reply_text("Нужна цифра, пример: 5")
-            return
+            return await update.message.reply_text("Цифрой. Пример: 5")
 
         if not (MIN_COUNT <= cnt <= MAX_COUNT):
-            await update.message.reply_text(f"Диапазон: {MIN_COUNT}–{MAX_COUNT}")
-            return
+            return await update.message.reply_text("От 3 до 10.")
 
-        settings.count = cnt
+        s.count = cnt
         save_users()
 
-        clear_user_jobs(app, uid)
-        plan_today(app, uid, settings)
-        schedule_midnight(app, uid, settings)
+        clear_jobs(app, uid)
+        schedule_today(app, uid, s)
+        schedule_midnight(app, uid, s)
 
-        context.user_data["mode"] = None
-        await update.message.reply_text(f"Теперь уведомлений: {cnt}")
-        return
+        ctx.user_data["mode"] = None
+        return await update.message.reply_text(f"Теперь {cnt} уведомлений в день!")
 
-# ===================== STARTUP =====================
+# ---------------------- FLASK SERVER (WEBHOOK) ----------------------
 
-async def on_startup(app):
+app = Flask(__name__)
+
+@app.route("/ping")
+def ping():
+    return "ok", 200
+
+@app.route("/webhook", methods=["POST"])
+def webhook_handler():
+    data = request.get_json()
+    if data:
+        update = Update.de_json(data, application.bot)
+        application.update_queue.put_nowait(update)
+    return "ok", 200
+
+# ---------------------- START APPLICATION ----------------------
+
+def start_bot():
+    global application
+
+    application = Application.builder().token(TOKEN).concurrent_updates(True).build()
+
+    # Commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("settz", settz))
+    application.add_handler(CommandHandler("settime", settime))
+    application.add_handler(CommandHandler("setcount", setcount))
+    application.add_handler(CommandHandler("status", status))
+
+    # Text
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+
+    # Load users and schedule jobs
     load_users()
-    for uid, settings in USERS.items():
-        clear_user_jobs(app, uid)
-        plan_today(app, uid, settings)
-        schedule_midnight(app, uid, settings)
+    for uid, s in USERS.items():
+        clear_jobs(application, uid)
+        schedule_today(application, uid, s)
+        schedule_midnight(application, uid, s)
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.post_init = on_startup
+    # Autoping every 10 min
+    application.job_queue.run_repeating(job_ping, interval=600, first=10)
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("settz", cmd_settz))
-    app.add_handler(CommandHandler("settime", cmd_settime))
-    app.add_handler(CommandHandler("setcount", cmd_setcount))
-    app.add_handler(CommandHandler("status", cmd_status))
+    # Start webhook
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        url_path="webhook",
+        webhook_url=WEBHOOK_URL,
+    )
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+start_bot()
 
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
